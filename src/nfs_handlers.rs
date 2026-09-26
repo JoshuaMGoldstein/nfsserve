@@ -2221,6 +2221,8 @@ mod commit_tests {
         read_only: bool,
         commit_result: Mutex<Result<fattr3, nfsstat3>>,
         committed: Mutex<Vec<(fileid3, u64, u32)>>,
+        writes: Mutex<Vec<(fileid3, u64, Vec<u8>, WriteStability)>>,
+        write_result: Mutex<Result<(fattr3, WriteStability), nfsstat3>>,
     }
 
     impl Default for TestFs {
@@ -2229,6 +2231,8 @@ mod commit_tests {
                 read_only: false,
                 commit_result: Mutex::new(Ok(fattr3::default())),
                 committed: Mutex::new(Vec::new()),
+                writes: Mutex::new(Vec::new()),
+                write_result: Mutex::new(Ok((fattr3::default(), WriteStability::Unstable))),
             }
         }
     }
@@ -2262,6 +2266,16 @@ mod commit_tests {
         }
         async fn write(&self, _: fileid3, _: u64, _: &[u8]) -> Result<fattr3, nfsstat3> {
             Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn write_with_stability(
+            &self,
+            id: fileid3,
+            offset: u64,
+            data: &[u8],
+            requested: WriteStability,
+        ) -> Result<(fattr3, WriteStability), nfsstat3> {
+            self.writes.lock().unwrap().push((id, offset, data.to_vec(), requested));
+            self.write_result.lock().unwrap().clone()
         }
         async fn create(&self, _: fileid3, _: &filename3, _: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
             Err(nfsstat3::NFS3ERR_NOTSUPP)
@@ -2331,6 +2345,99 @@ mod commit_tests {
         bytes
     }
 
+    fn write_args(id: fileid3, offset: u64, stable: stable_how, data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        WRITE3args {
+            file: nfs_fh3 {
+                data: id.to_le_bytes().to_vec(),
+            },
+            offset,
+            count: data.len() as u32,
+            stable,
+            data: data.to_vec(),
+        }
+        .serialize(&mut bytes)
+        .unwrap();
+        bytes
+    }
+
+    fn serialized_status(status: nfsstat3) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        status.serialize(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn commit_dispatches_and_serializes_success_wcc_verifier() {
+        let fs = Arc::new(TestFs {
+            commit_result: Mutex::new(Ok(fattr3 {
+                fileid: 7,
+                size: 42,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let args = commit_args(7, 12, 34);
+        let mut input = args.as_slice();
+        let mut output = Vec::new();
+        handle_nfs(
+            77,
+            call_body {
+                rpcvers: 2,
+                prog: nfs::PROGRAM,
+                vers: nfs::VERSION,
+                proc: NFSProgram::NFSPROC3_COMMIT as u32,
+                cred: opaque_auth::default(),
+                verf: opaque_auth::default(),
+            },
+            &mut input,
+            &mut output,
+            &context(Arc::clone(&fs)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*fs.committed.lock().unwrap(), vec![(7, 12, 34)]);
+        assert!(output
+            .windows(serialized_status(nfsstat3::NFS3_OK).len())
+            .any(|w| w == serialized_status(nfsstat3::NFS3_OK)));
+        assert!(output.windows(8).any(|w| w == context(Arc::clone(&fs)).vfs.serverid()));
+    }
+
+    #[tokio::test]
+    async fn write_forwards_requested_stability_and_never_false_filesync() {
+        let fs = Arc::new(TestFs {
+            write_result: Mutex::new(Ok((
+                fattr3 {
+                    fileid: 9,
+                    ..Default::default()
+                },
+                WriteStability::Unstable,
+            ))),
+            ..Default::default()
+        });
+        let args = write_args(9, 4, stable_how::FILE_SYNC, b"data");
+        let mut input = args.as_slice();
+        let mut output = Vec::new();
+        nfsproc3_write(3, &mut input, &mut output, &context(Arc::clone(&fs)))
+            .await
+            .unwrap();
+        assert_eq!(*fs.writes.lock().unwrap(), vec![(9, 4, b"data".to_vec(), WriteStability::FileSync)]);
+        let unstable = stable_how::UNSTABLE as u32;
+        assert!(output.windows(4).any(|w| w == unstable.to_be_bytes()));
+        assert!(!output.windows(4).any(|w| w == (stable_how::FILE_SYNC as u32).to_be_bytes()));
+
+        *fs.write_result.lock().unwrap() = Err(nfsstat3::NFS3ERR_IO);
+        let args = write_args(9, 4, stable_how::FILE_SYNC, b"data");
+        let mut input = args.as_slice();
+        let mut output = Vec::new();
+        nfsproc3_write(4, &mut input, &mut output, &context(Arc::clone(&fs)))
+            .await
+            .unwrap();
+        assert!(output
+            .windows(serialized_status(nfsstat3::NFS3ERR_IO).len())
+            .any(|w| w == serialized_status(nfsstat3::NFS3ERR_IO)));
+        assert!(!output.windows(4).any(|w| w == (stable_how::FILE_SYNC as u32).to_be_bytes()));
+    }
     #[tokio::test]
     async fn commit_forwards_range_wcc_and_verifier() {
         let fs = Arc::new(TestFs {
