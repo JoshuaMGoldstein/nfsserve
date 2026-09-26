@@ -10,7 +10,7 @@ use tracing::{debug, error, trace, warn};
 use crate::context::RPCContext;
 use crate::nfs;
 use crate::rpc::*;
-use crate::vfs::VFSCapabilities;
+use crate::vfs::{VFSCapabilities, WriteStability};
 use crate::xdr::*;
 /*
 program NFS_PROGRAM {
@@ -141,6 +141,7 @@ pub async fn handle_nfs(
         NFSProgram::NFSPROC3_READDIR => nfsproc3_readdir(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_READDIRPLUS => nfsproc3_readdirplus(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_WRITE => nfsproc3_write(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_COMMIT => nfsproc3_commit(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_CREATE => nfsproc3_create(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_SETATTR => nfsproc3_setattr(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_REMOVE => nfsproc3_remove(xid, input, output, context).await?,
@@ -1088,7 +1089,7 @@ struct WRITE3args {
     file: nfs::nfs_fh3,
     offset: nfs::offset3,
     count: nfs::count3,
-    stable: u32,
+    stable: stable_how,
     data: Vec<u8>,
 }
 xdr_struct!(WRITE3args, file, offset, count, stable, data);
@@ -1139,6 +1140,22 @@ union WRITE3res switch (nfsstat3 status) {
 };
 
  */
+fn write_stability(stable: stable_how) -> WriteStability {
+    match stable {
+        stable_how::UNSTABLE => WriteStability::Unstable,
+        stable_how::DATA_SYNC => WriteStability::DataSync,
+        stable_how::FILE_SYNC => WriteStability::FileSync,
+    }
+}
+
+fn nfs_stability(stable: WriteStability) -> stable_how {
+    match stable {
+        WriteStability::Unstable => stable_how::UNSTABLE,
+        WriteStability::DataSync => stable_how::DATA_SYNC,
+        WriteStability::FileSync => stable_how::FILE_SYNC,
+    }
+}
+
 pub async fn nfsproc3_write(
     xid: u32,
     input: &mut impl Read,
@@ -1185,8 +1202,12 @@ pub async fn nfsproc3_write(
         Err(_) => nfs::pre_op_attr::Void,
     };
 
-    match context.vfs.write(id, args.offset, &args.data).await {
-        Ok(fattr) => {
+    match context
+        .vfs
+        .write_with_stability(id, args.offset, &args.data, write_stability(args.stable))
+        .await
+    {
+        Ok((fattr, committed)) => {
             debug!("write success {:?} --> {:?}", xid, fattr);
             let res = WRITE3resok {
                 file_wcc: nfs::wcc_data {
@@ -1194,7 +1215,7 @@ pub async fn nfsproc3_write(
                     after: nfs::post_op_attr::attributes(fattr),
                 },
                 count: args.count,
-                committed: stable_how::FILE_SYNC,
+                committed: nfs_stability(committed),
                 verf: context.vfs.serverid(),
             };
             make_success_reply(xid).serialize(output)?;
@@ -1203,6 +1224,76 @@ pub async fn nfsproc3_write(
         },
         Err(stat) => {
             error!("write error {:?} --> {:?}", xid, stat);
+            make_success_reply(xid).serialize(output)?;
+            stat.serialize(output)?;
+            nfs::wcc_data::default().serialize(output)?;
+        },
+    }
+    Ok(())
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct COMMIT3args {
+    file: nfs::nfs_fh3,
+    offset: nfs::offset3,
+    count: nfs::count3,
+}
+xdr_struct!(COMMIT3args, file, offset, count);
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct COMMIT3resok {
+    file_wcc: nfs::wcc_data,
+    verf: nfs::writeverf3,
+}
+xdr_struct!(COMMIT3resok, file_wcc, verf);
+
+pub async fn nfsproc3_commit(
+    xid: u32,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    context: &RPCContext,
+) -> Result<(), anyhow::Error> {
+    if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_ROFS.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
+        return Ok(());
+    }
+    let mut args = COMMIT3args::default();
+    args.deserialize(input)?;
+    let id = match context.vfs.fh_to_id(&args.file) {
+        Ok(id) => id,
+        Err(stat) => {
+            make_success_reply(xid).serialize(output)?;
+            stat.serialize(output)?;
+            nfs::wcc_data::default().serialize(output)?;
+            return Ok(());
+        },
+    };
+    let before = match context.vfs.getattr(id).await {
+        Ok(v) => nfs::pre_op_attr::attributes(nfs::wcc_attr {
+            size: v.size,
+            mtime: v.mtime,
+            ctime: v.ctime,
+        }),
+        Err(_) => nfs::pre_op_attr::Void,
+    };
+    match context.vfs.commit(id, args.offset, args.count).await {
+        Ok(fattr) => {
+            let result = COMMIT3resok {
+                file_wcc: nfs::wcc_data {
+                    before,
+                    after: nfs::post_op_attr::attributes(fattr),
+                },
+                verf: context.vfs.serverid(),
+            };
+            make_success_reply(xid).serialize(output)?;
+            nfs::nfsstat3::NFS3_OK.serialize(output)?;
+            result.serialize(output)?;
+        },
+        Err(stat) => {
             make_success_reply(xid).serialize(output)?;
             stat.serialize(output)?;
             nfs::wcc_data::default().serialize(output)?;
@@ -2112,4 +2203,189 @@ pub async fn nfsproc3_readlink(
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::nfs::*;
+    use crate::transaction_tracker::TransactionTracker;
+    use crate::vfs::{NFSFileSystem, ReadDirResult};
+
+    struct TestFs {
+        read_only: bool,
+        commit_result: Mutex<Result<fattr3, nfsstat3>>,
+        committed: Mutex<Vec<(fileid3, u64, u32)>>,
+    }
+
+    impl Default for TestFs {
+        fn default() -> Self {
+            Self {
+                read_only: false,
+                commit_result: Mutex::new(Ok(fattr3::default())),
+                committed: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NFSFileSystem for TestFs {
+        fn capabilities(&self) -> VFSCapabilities {
+            if self.read_only {
+                VFSCapabilities::ReadOnly
+            } else {
+                VFSCapabilities::ReadWrite
+            }
+        }
+        fn root_dir(&self) -> fileid3 {
+            1
+        }
+        async fn lookup(&self, _: fileid3, _: &filename3) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOENT)
+        }
+        async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
+            Ok(fattr3 {
+                fileid: id,
+                ..Default::default()
+            })
+        }
+        async fn setattr(&self, _: fileid3, _: sattr3) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn read(&self, _: fileid3, _: u64, _: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn write(&self, _: fileid3, _: u64, _: &[u8]) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn create(&self, _: fileid3, _: &filename3, _: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn create_exclusive(&self, _: fileid3, _: &filename3) -> Result<fileid3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn mkdir(&self, _: fileid3, _: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn remove(&self, _: fileid3, _: &filename3) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn rename(&self, _: fileid3, _: &filename3, _: fileid3, _: &filename3) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readdir(&self, _: fileid3, _: fileid3, _: usize) -> Result<ReadDirResult, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn symlink(
+            &self,
+            _: fileid3,
+            _: &filename3,
+            _: &nfspath3,
+            _: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        async fn readlink(&self, _: fileid3) -> Result<nfspath3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
+        fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+            if fh.data.len() != 8 {
+                return Err(nfsstat3::NFS3ERR_BADHANDLE);
+            }
+            Ok(u64::from_le_bytes(fh.data.as_slice().try_into().unwrap()))
+        }
+        async fn commit(&self, id: fileid3, offset: u64, count: u32) -> Result<fattr3, nfsstat3> {
+            self.committed.lock().unwrap().push((id, offset, count));
+            self.commit_result.lock().unwrap().clone()
+        }
+    }
+
+    fn context(fs: Arc<TestFs>) -> RPCContext {
+        RPCContext {
+            local_port: 0,
+            client_addr: "test".into(),
+            auth: crate::rpc::auth_unix::default(),
+            vfs: fs,
+            mount_signal: None,
+            export_name: Arc::new("/".into()),
+            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(1))),
+        }
+    }
+
+    fn commit_args(id: fileid3, offset: u64, count: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        COMMIT3args {
+            file: nfs_fh3 {
+                data: id.to_le_bytes().to_vec(),
+            },
+            offset,
+            count,
+        }
+        .serialize(&mut bytes)
+        .unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn commit_forwards_range_wcc_and_verifier() {
+        let fs = Arc::new(TestFs {
+            commit_result: Mutex::new(Ok(fattr3 {
+                fileid: 7,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let args = commit_args(7, 12, 34);
+        let mut input = args.as_slice();
+        let mut output = Vec::new();
+        nfsproc3_commit(99, &mut input, &mut output, &context(Arc::clone(&fs)))
+            .await
+            .unwrap();
+        assert_eq!(*fs.committed.lock().unwrap(), vec![(7, 12, 34)]);
+        assert!(!output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_propagates_backend_status_and_rejects_readonly() {
+        let failing = Arc::new(TestFs {
+            commit_result: Mutex::new(Err(nfsstat3::NFS3ERR_IO)),
+            ..Default::default()
+        });
+        let args = commit_args(7, 0, 0);
+        let mut input = args.as_slice();
+        let mut output = Vec::new();
+        nfsproc3_commit(1, &mut input, &mut output, &context(Arc::clone(&failing)))
+            .await
+            .unwrap();
+        assert_eq!(*failing.committed.lock().unwrap(), vec![(7, 0, 0)]);
+        assert!(!output.is_empty());
+
+        let readonly = Arc::new(TestFs {
+            read_only: true,
+            ..Default::default()
+        });
+        let args = commit_args(7, 0, 0);
+        let mut input = args.as_slice();
+        let mut output = Vec::new();
+        nfsproc3_commit(2, &mut input, &mut output, &context(Arc::clone(&readonly)))
+            .await
+            .unwrap();
+        assert!(readonly.committed.lock().unwrap().is_empty());
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn write_stability_is_never_upgraded() {
+        assert_eq!(write_stability(stable_how::UNSTABLE), WriteStability::Unstable);
+        assert_eq!(write_stability(stable_how::DATA_SYNC), WriteStability::DataSync);
+        assert_eq!(write_stability(stable_how::FILE_SYNC), WriteStability::FileSync);
+        assert!(matches!(nfs_stability(WriteStability::Unstable), stable_how::UNSTABLE));
+        assert!(matches!(nfs_stability(WriteStability::DataSync), stable_how::DATA_SYNC));
+        assert!(matches!(nfs_stability(WriteStability::FileSync), stable_how::FILE_SYNC));
+    }
 }

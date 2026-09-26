@@ -64,6 +64,14 @@ pub enum VFSCapabilities {
     ReadWrite,
 }
 
+/// The durability level actually provided for a successful WRITE.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WriteStability {
+    Unstable,
+    DataSync,
+    FileSync,
+}
+
 /// The basic API to implement to provide an NFS file system
 ///
 /// Opaque FH
@@ -126,6 +134,30 @@ pub trait NFSFileSystem: Sync {
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
+
+    /// Writes data and reports the durability level actually achieved.
+    ///
+    /// Existing implementations remain source-compatible and are conservatively
+    /// reported as unstable. Implementations that claim DATA_SYNC or FILE_SYNC
+    /// must explicitly override this method and complete the corresponding
+    /// durability operation before returning success.
+    async fn write_with_stability(
+        &self,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+        _requested: WriteStability,
+    ) -> Result<(fattr3, WriteStability), nfsstat3> {
+        Ok((self.write(id, offset, data).await?, WriteStability::Unstable))
+    }
+
+    /// Makes previously written data stable for an opaque retained object.
+    ///
+    /// There is intentionally no success default: a backend must opt in to
+    /// COMMIT durability or return NOTSUPP.
+    async fn commit(&self, _id: fileid3, _offset: u64, _count: u32) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    }
 
     /// Creates a file with the following attributes.
     /// If not supported due to readonly file system
